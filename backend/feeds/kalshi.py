@@ -184,16 +184,40 @@ class KalshiClient:
         cursor: str = None,
     ) -> list[dict]:
         """
-        Fetch open markets. Key fields per market:
-          ticker, title, status, close_time,
-          yes_ask, yes_bid, no_ask, no_bid  (prices in cents, 1-99)
-          volume, open_interest
+        Fetch open markets via the events endpoint (which has richer data +
+        correct pricing). Returns a flat list of market dicts enriched with
+        the parent event's title and category.
+
+        Real field names (all prices in dollars 0.0–1.0):
+          yes_ask_dollars, yes_bid_dollars, no_ask_dollars, no_bid_dollars
+          volume_fp, open_interest_fp, liquidity_dollars
+          close_time, ticker, title, category (from event)
         """
-        params = {"status": status, "limit": limit}
+        params = {"status": status, "limit": limit, "with_nested_markets": "true"}
         if cursor:
             params["cursor"] = cursor
-        data = await self._get("/markets", params)
-        return data.get("markets", [])
+        data = await self._get("/events", params)
+        events = data.get("events", [])
+
+        # Flatten events → markets, attach event-level metadata
+        markets = []
+        for event in events:
+            event_title    = event.get("title", "")
+            event_category = event.get("category", "")
+            for m in event.get("markets", []):
+                m["event_title"]    = event_title
+                m["event_category"] = event_category
+                # Normalise: use market title if set, else event title
+                if not m.get("title"):
+                    m["title"] = event_title
+                markets.append(m)
+
+        return markets
+
+    async def get_events(self, status: str = "open", limit: int = 200) -> list[dict]:
+        """Raw events list (without flattening)."""
+        data = await self._get("/events", {"status": status, "limit": limit, "with_nested_markets": "true"})
+        return data.get("events", [])
 
     async def get_market(self, ticker: str) -> dict:
         data = await self._get(f"/markets/{ticker}")
@@ -206,7 +230,7 @@ class KalshiClient:
     # ── Account ───────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> dict:
-        """Returns {"balance": cents}"""
+        """Returns raw balance dict. Use balance_cents / 100 for dollars."""
         return await self._get("/portfolio/balance")
 
     async def get_positions(self) -> list[dict]:

@@ -7,6 +7,7 @@ import { Watchlist } from '@/components/Watchlist'
 import { History } from '@/components/History'
 import { Analytics } from '@/components/Analytics'
 import { TradeQueue } from '@/components/TradeQueue'
+import { KalshiPanel } from '@/components/KalshiPanel'
 
 const API = process.env.NEXT_PUBLIC_API_URL
 const WS  = process.env.NEXT_PUBLIC_WS_URL
@@ -46,13 +47,18 @@ export default function Dashboard() {
   const [watchlist, setWatchlist] = useState<string[]>([])
   const [positions, setPositions] = useState([])
   const [account, setAccount]     = useState(null)
-  const [activeTab, setActiveTab] = useState<'feed' | 'history' | 'trade' | 'analytics'>('feed')
+  const [activeTab, setActiveTab] = useState<'feed' | 'history' | 'trade' | 'analytics' | 'kalshi'>('feed')
+  const [kalshiScan, setKalshiScan] = useState<Record<string, unknown> | null>(null)
 
   const onSignal = useCallback((signal: Signal) => {
     setSignals(prev => [signal, ...prev].slice(0, 500))
   }, [])
 
-  const { connected } = useWebSocket(WS!, { onSignal })
+  const onKalshiScan = useCallback((data: Record<string, unknown>) => {
+    setKalshiScan(data)
+  }, [])
+
+  const { connected } = useWebSocket(WS!, { onSignal, onKalshiScan })
 
   async function refreshAccount() {
     try {
@@ -161,6 +167,7 @@ export default function Dashboard() {
               { id: 'history',   label: '🗄️ History' },
               { id: 'analytics', label: '🎯 Patterns' },
               { id: 'trade',     label: '💹 Trade' },
+              { id: 'kalshi',    label: '🎰 Kalshi' },
             ] as const).map(tab => (
               <button
                 key={tab.id}
@@ -194,6 +201,9 @@ export default function Dashboard() {
                 onRefresh={refreshAccount}
               />
             </div>
+          )}
+          {activeTab === 'kalshi' && (
+            <KalshiPanel wsData={kalshiScan} />
           )}
         </aside>
       </div>

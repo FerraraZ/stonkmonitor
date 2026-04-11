@@ -6,6 +6,8 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 export type WsMessage =
   | { type: 'signal'; data: Signal }
   | { type: 'feed'; feed: string; data: Record<string, unknown> }
+  | { type: 'kalshi_scan'; data: Record<string, unknown> }
+  | { type: 'trade_queued'; data: Record<string, unknown> }
   | { type: 'status'; message: string }
   | { type: 'pong' }
 
@@ -26,13 +28,14 @@ export interface Signal {
 interface UseWebSocketOptions {
   onSignal?: (signal: Signal) => void
   onFeed?: (feed: string, data: Record<string, unknown>) => void
+  onKalshiScan?: (data: Record<string, unknown>) => void
 }
 
 export function useWebSocket(url: string, opts: UseWebSocketOptions = {}) {
   const ws = useRef<WebSocket | null>(null)
   const [connected, setConnected] = useState(false)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>()
-  const { onSignal, onFeed } = opts
+  const { onSignal, onFeed, onKalshiScan } = opts
 
   const connect = useCallback(() => {
     try {
@@ -56,6 +59,7 @@ export function useWebSocket(url: string, opts: UseWebSocketOptions = {}) {
           const msg: WsMessage = JSON.parse(ev.data)
           if (msg.type === 'signal' && onSignal) onSignal(msg.data)
           if (msg.type === 'feed' && onFeed) onFeed(msg.feed, msg.data)
+          if (msg.type === 'kalshi_scan' && onKalshiScan) onKalshiScan(msg.data)
         } catch {}
       }
 
@@ -70,7 +74,7 @@ export function useWebSocket(url: string, opts: UseWebSocketOptions = {}) {
     } catch (e) {
       reconnectTimer.current = setTimeout(connect, 5_000)
     }
-  }, [url, onSignal, onFeed])
+  }, [url, onSignal, onFeed, onKalshiScan])
 
   useEffect(() => {
     connect()
