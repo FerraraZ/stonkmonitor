@@ -21,7 +21,11 @@ from signals.engine import SignalEngine
 from signals.patterns import PatternEngine
 from signals.auto_trade import AutoTradeEngine
 from signals.kalshi_scanner import KalshiScanner
+from signals.kalshi_arb import KalshiArbScanner
+from signals.kalshi_poly_arb import KalshiPolyArbScanner
 from feeds.kalshi import KalshiClient
+from feeds.dome import DomeClient
+from feeds.polymarket import PolymarketClobClient
 from notifications.discord import DiscordNotifier
 from notifications.pushover import PushoverNotifier
 from notifications.telegram import TelegramNotifier
@@ -60,14 +64,22 @@ telegram    = TelegramNotifier(settings.telegram_bot_token, settings.telegram_ch
 auto_trade  = AutoTradeEngine(settings)
 
 # Kalshi — only init if credentials set
-kalshi_client  = None
-kalshi_scanner = KalshiScanner(settings)
+kalshi_client      = None
+kalshi_scanner     = KalshiScanner(settings)
+kalshi_arb_scanner = KalshiArbScanner(settings)
 if settings.kalshi_key_id and not settings.kalshi_key_id.startswith("your_"):
     kalshi_client = KalshiClient(
         key_id=settings.kalshi_key_id,
         private_key_pem=settings.kalshi_private_key,
         demo=settings.kalshi_demo,
     )
+
+# Dome + Polymarket — cross-platform prediction market arb
+dome_client           = DomeClient(settings.dome_api_key, settings.dome_base_url)
+polymarket_client     = PolymarketClobClient(settings.polymarket_clob_url)
+cross_arb_scanner     = KalshiPolyArbScanner(
+    dome_client, polymarket_client, min_edge=settings.cross_arb_min_edge
+)
 
 # In-memory signal store (last 500 signals)
 signal_store: list[dict] = []
@@ -263,6 +275,64 @@ async def kalshi_scan_loop():
             balance_usd  = balance_data.get("balance", 0) / 100  # cents → dollars
             markets      = await kalshi_client.get_markets()  # paginates all categories
             opps         = kalshi_scanner.scan(markets, balance_usd)
+
+            # ── Arb scans (free, run every cycle) ────────────────────────
+            try:
+                arb_opps = kalshi_arb_scanner.scan(markets)
+                if arb_opps:
+                    top_arb = arb_opps[:10]
+                    logger.info(
+                        f"Kalshi arb: {len(arb_opps)} monotonicity/sum violations "
+                        f"(top edge {top_arb[0].edge*100:.1f}¢)"
+                    )
+                    await manager.broadcast({
+                        "type": "kalshi_arb",
+                        "data": {
+                            "opportunities": [o.to_dict() for o in top_arb],
+                            "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
+                        },
+                    })
+                    # Telegram alert only when the best edge is meaningful
+                    if _startup_complete and top_arb[0].edge >= 0.03:
+                        best = top_arb[0]
+                        await telegram.send_info(
+                            f"<b>⚖️ KALSHI ARB — {best.arb_type.upper()}</b>\n"
+                            f"{best.event_title[:70]}\n"
+                            f"Edge: <b>{best.edge*100:.1f}¢</b> | Score {best.score():.1f}\n"
+                            f"<i>{best.rationale[:180]}</i>"
+                        )
+            except Exception as e:
+                logger.warning(f"Kalshi arb scan error: {e}")
+
+            # Cross-platform scan runs only if Dome is configured
+            if dome_client.enabled:
+                try:
+                    cross_opps = await cross_arb_scanner.scan(markets)
+                    if cross_opps:
+                        top_cross = cross_opps[:10]
+                        logger.info(
+                            f"Cross-arb: {len(cross_opps)} K↔P candidates "
+                            f"(top edge {top_cross[0].edge*100:.1f}¢)"
+                        )
+                        await manager.broadcast({
+                            "type": "kalshi_cross_arb",
+                            "data": {
+                                "opportunities": [o.to_dict() for o in top_cross],
+                                "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
+                            },
+                        })
+                        if _startup_complete and top_cross[0].edge >= 0.05:
+                            best = top_cross[0]
+                            await telegram.send_info(
+                                f"<b>🔀 CROSS-PLATFORM ARB</b>\n"
+                                f"K: {best.kalshi_title[:60]}\n"
+                                f"P: {best.poly_title[:60]}\n"
+                                f"Edge: <b>{best.edge*100:.1f}¢</b> | "
+                                f"Match: {best.match_confidence*100:.0f}%\n"
+                                f"<i>{best.rationale[:180]}</i>"
+                            )
+                except Exception as e:
+                    logger.warning(f"Cross-arb scan error: {e}")
 
             if opps:
                 top = opps[:10]

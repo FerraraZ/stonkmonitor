@@ -40,6 +40,14 @@ class Settings(BaseSettings):
     kalshi_max_bet_usd: float = Field(500.0, env="KALSHI_MAX_BET_USD")
     kalshi_auto_execute: bool = Field(False, env="KALSHI_AUTO_EXECUTE")  # require confirmation first
 
+    # --- Dome API (cross-platform prediction market data) ---
+    dome_api_key: str = Field("", env="DOME_API_KEY")
+    dome_base_url: str = Field("https://api.domeapi.io", env="DOME_BASE_URL")
+    # --- Polymarket CLOB (public, no auth) ---
+    polymarket_clob_url: str = Field("https://clob.polymarket.com", env="POLYMARKET_CLOB_URL")
+    # --- Cross-platform arb ---
+    cross_arb_min_edge: float = Field(0.05, env="CROSS_ARB_MIN_EDGE")  # 5¢ minimum spread
+
     # --- Auto-Trade ---
     auto_trade_enabled: bool = Field(True, env="AUTO_TRADE_ENABLED")
     auto_trade_max_risk_pct: float = Field(0.02, env="AUTO_TRADE_MAX_RISK_PCT")
