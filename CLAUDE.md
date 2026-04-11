@@ -190,9 +190,8 @@ IV scanner loop (every 5 min per watchlist ticker):
 
 ## Telegram Bot — Critical Details
 
-**Bot:** @stonktracker69_bot
-**Token:** in `.env` as `TELEGRAM_BOT_TOKEN`
-**Chat ID:** REDACTED_CHAT_ID (franesqu) — stored in `.env`, resolved on startup
+**Bot:** configured via `TELEGRAM_BOT_TOKEN` in `.env`
+**Chat ID:** stored in `.env` as `TELEGRAM_CHAT_ID` — auto-resolved on startup via `getUpdates` if not set
 
 **Key methods:**
 - `send_trade_alert(trade)` — Alpaca trade card with ✅ EXECUTE / ❌ SKIP

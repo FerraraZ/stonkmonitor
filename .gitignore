@@ -5,6 +5,9 @@
 *.env
 *.pem
 
+# ── Claude Code internal files (may contain API keys from session history) ──
+.claude/
+
 # ── Database ──────────────────────────────────────────────────────────
 backend/*.db
 backend/*.db-shm
