@@ -77,9 +77,28 @@ _startup_complete = False
 
 # ── Kalshi pending orders ────────────────────────────────────────────────────
 _kalshi_pending: dict[int, dict] = {}   # alert_id → order params
-_kalshi_alerted: dict[str, float] = {}  # ticker → epoch when last buy-alerted
 _kalshi_alert_counter = 0
-KALSHI_ALERT_COOLDOWN = 3600  # don't re-alert same ticker within 1 hour
+
+# ── Kalshi alert suppression ─────────────────────────────────────────────────
+# Tracks every market we've ever alerted on so we don't spam the same plays.
+# Re-alert only when something *meaningfully* changes.
+#
+# _kalshi_seen[ticker] = {
+#   "price_cents":  float   — price at time of last alert
+#   "alerted_at":   float   — epoch of last alert
+#   "outcome":      str     — "pending" | "executed" | "skipped" | "expired"
+# }
+#
+# Re-alert rules:
+#   - "executed"  → never re-alert for a buy (position monitor handles exits)
+#   - "skipped" / "expired" → only re-alert if price moved ≥ SIGNIFICANT_MOVE_CENTS
+#                             AND at least MIN_RESUPPRESS_HOURS have passed
+#   - "pending"   → alert already live, don't send another
+_kalshi_seen: dict[str, dict] = {}
+
+SIGNIFICANT_MOVE_CENTS  = 10.0   # abs price change that warrants a new alert
+SIGNIFICANT_MOVE_PCT    = 0.50   # OR 50% relative change (1¢→1.5¢ is big)
+MIN_RESUPPRESS_HOURS    = 6      # even with a big move, wait at least 6h
 
 # ── Kalshi position tracking (for sell alerts) ────────────────────────────────
 # Populated when we confirm a buy; monitored for exit signals
@@ -187,6 +206,16 @@ async def kalshi_scan_loop():
     await asyncio.sleep(15)  # wait for startup
     while True:
         try:
+            # Mark any pending alerts whose 10-min window has passed as expired
+            now_pre = _time.time()
+            for alert_id, p in list(_kalshi_pending.items()):
+                if now_pre > p["expires"]:
+                    _kalshi_pending.pop(alert_id, None)
+                    seen = _kalshi_seen.get(p["ticker"])
+                    if seen and seen["outcome"] == "pending":
+                        seen["outcome"] = "expired"
+                        logger.debug(f"KALSHI alert #{alert_id} expired: {p['ticker']}")
+
             balance_data = await kalshi_client.get_balance()
             balance_usd  = balance_data.get("balance", 0) / 100  # cents → dollars
             markets      = await kalshi_client.get_markets()  # paginates all categories
@@ -204,37 +233,74 @@ async def kalshi_scan_loop():
                     }
                 })
 
-                # Telegram alert with Execute/Skip buttons (score >= 7, not recently alerted)
+                # Telegram alert with Execute/Skip buttons
                 if _startup_complete:
                     now = _time.time()
                     for opp in top:
                         if opp.score() < 7.0:
                             break  # sorted by score, rest will be lower
-                        last = _kalshi_alerted.get(opp.ticker, 0)
-                        if now - last < KALSHI_ALERT_COOLDOWN:
-                            continue  # skip — already alerted recently
 
+                        ticker      = opp.ticker
+                        price_cents = opp.market_price * 100
+                        seen        = _kalshi_seen.get(ticker)
+
+                        if seen:
+                            outcome = seen["outcome"]
+
+                            # Already have a position — position monitor handles this
+                            if outcome == "executed" or ticker in _kalshi_positions:
+                                continue
+
+                            # Alert is still live (pending) — don't double-send
+                            if outcome == "pending":
+                                continue
+
+                            # Skipped or expired — only re-alert on significant price move
+                            if outcome in ("skipped", "expired"):
+                                hours_since = (now - seen["alerted_at"]) / 3600
+                                if hours_since < MIN_RESUPPRESS_HOURS:
+                                    continue
+
+                                prev_price = seen["price_cents"]
+                                abs_move   = abs(price_cents - prev_price)
+                                rel_move   = abs_move / prev_price if prev_price > 0 else 0
+                                moved_enough = (abs_move >= SIGNIFICANT_MOVE_CENTS or
+                                                rel_move >= SIGNIFICANT_MOVE_PCT)
+                                if not moved_enough:
+                                    continue  # same market, same price — stay quiet
+
+                                logger.info(
+                                    f"KALSHI re-alert {ticker}: price moved "
+                                    f"{prev_price:.0f}¢ → {price_cents:.0f}¢ "
+                                    f"({abs_move:.0f}¢ / {rel_move*100:.0f}%)"
+                                )
+
+                        # ── Send the alert ─────────────────────────────────
                         _kalshi_alert_counter += 1
                         alert_id = _kalshi_alert_counter
                         opp_dict = opp.to_dict()
-                        # Store params needed to place the order
-                        _kalshi_pending[alert_id] = {
-                            "ticker":    opp.ticker,
-                            "side":      opp.side if opp.side != "watch" else "yes",
-                            "count":     opp.bet_contracts,
-                            "price_cents": round(opp.market_price * 100),
-                            "title":     opp.title,
-                            "opp_dict":  opp_dict,
-                            "expires":   now + 600,  # 10-minute window
-                        }
-                        _kalshi_alerted[opp.ticker] = now
 
-                        msg_id = await telegram.send_kalshi_alert(opp_dict, alert_id)
+                        _kalshi_pending[alert_id] = {
+                            "ticker":      ticker,
+                            "side":        opp.side if opp.side != "watch" else "yes",
+                            "count":       opp.bet_contracts,
+                            "price_cents": round(price_cents),
+                            "title":       opp.title,
+                            "opp_dict":    opp_dict,
+                            "expires":     now + 600,
+                        }
+                        _kalshi_seen[ticker] = {
+                            "price_cents": price_cents,
+                            "alerted_at":  now,
+                            "outcome":     "pending",
+                        }
+
+                        await telegram.send_kalshi_alert(opp_dict, alert_id)
                         logger.info(
-                            f"KALSHI ALERT #{alert_id}: {opp.ticker} {opp.side.upper()} "
-                            f"@ {opp.market_price*100:.0f}¢ score={opp.score():.1f}"
+                            f"KALSHI ALERT #{alert_id}: {ticker} {opp.side.upper()} "
+                            f"@ {price_cents:.0f}¢ score={opp.score():.1f}"
                         )
-                        break  # one alert per scan cycle to avoid spam
+                        break  # one alert per scan cycle
 
         except Exception as e:
             logger.error(f"Kalshi scan loop error: {e}")
@@ -251,6 +317,9 @@ async def confirm_kalshi(alert_id: int, msg_id: int):
         return
 
     if _time.time() > pending["expires"]:
+        seen = _kalshi_seen.get(pending["ticker"])
+        if seen:
+            seen["outcome"] = "expired"
         await telegram.edit_message(msg_id, "⏰ Order expired (10-min window passed).")
         return
 
@@ -275,6 +344,11 @@ async def confirm_kalshi(alert_id: int, msg_id: int):
         )
         logger.info(f"Kalshi order placed: {pending['ticker']} {pending['side']} "
                     f"×{pending['count']} @ {pending['price_cents']}¢ → {order_id}")
+
+        # Mark as executed — suppress future buy alerts on this ticker
+        seen = _kalshi_seen.get(pending["ticker"])
+        if seen:
+            seen["outcome"] = "executed"
 
         # Register position for sell monitoring
         ticker = pending["ticker"]
@@ -306,6 +380,10 @@ async def confirm_kalshi(alert_id: int, msg_id: int):
 async def skip_kalshi(alert_id: int, msg_id: int):
     """User tapped Skip on a Kalshi alert."""
     pending = _kalshi_pending.pop(alert_id, None)
+    if pending:
+        seen = _kalshi_seen.get(pending["ticker"])
+        if seen:
+            seen["outcome"] = "skipped"
     title = (pending or {}).get("title", "")[:50]
     await telegram.edit_message(msg_id, f"⏭ Skipped: {title}")
 
