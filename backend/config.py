@@ -32,9 +32,9 @@ class Settings(BaseSettings):
     telegram_chat_id: int = Field(0, env="TELEGRAM_CHAT_ID")
 
     # --- Kalshi ---
-    kalshi_email: str = Field("", env="KALSHI_EMAIL")
-    kalshi_password: str = Field("", env="KALSHI_PASSWORD")
-    kalshi_demo: bool = Field(True, env="KALSHI_DEMO")
+    kalshi_key_id: str = Field("", env="KALSHI_KEY_ID")
+    kalshi_private_key: str = Field("", env="KALSHI_PRIVATE_KEY")  # PEM string or .pem file path
+    kalshi_demo: bool = Field(False, env="KALSHI_DEMO")
     kalshi_scan_interval: int = Field(300, env="KALSHI_SCAN_INTERVAL")  # seconds
     kalshi_min_edge: float = Field(0.05, env="KALSHI_MIN_EDGE")
     kalshi_max_bet_usd: float = Field(500.0, env="KALSHI_MAX_BET_USD")

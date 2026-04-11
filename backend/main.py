@@ -62,10 +62,10 @@ auto_trade  = AutoTradeEngine(settings)
 # Kalshi — only init if credentials set
 kalshi_client  = None
 kalshi_scanner = KalshiScanner(settings)
-if settings.kalshi_email and not settings.kalshi_email.startswith("your_"):
+if settings.kalshi_key_id and not settings.kalshi_key_id.startswith("your_"):
     kalshi_client = KalshiClient(
-        settings.kalshi_email,
-        settings.kalshi_password,
+        key_id=settings.kalshi_key_id,
+        private_key_pem=settings.kalshi_private_key,
         demo=settings.kalshi_demo,
     )
 
@@ -254,7 +254,7 @@ async def lifespan(app: FastAPI):
     # Kalshi — login + start scan loop if configured
     kalshi_task = None
     if kalshi_client:
-        ok = await kalshi_client.login()
+        ok = await kalshi_client.ping()
         if ok:
             kalshi_task = asyncio.create_task(kalshi_scan_loop())
             logger.info("Kalshi scanner started")
