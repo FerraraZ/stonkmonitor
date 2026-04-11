@@ -75,6 +75,12 @@ signal_store: list[dict] = []
 # Suppress notifications during initial backfill on startup
 _startup_complete = False
 
+# ── Kalshi pending orders ────────────────────────────────────────────────────
+_kalshi_pending: dict[int, dict] = {}   # alert_id → order params
+_kalshi_alerted: dict[str, float] = {}  # ticker → epoch when last alerted
+_kalshi_alert_counter = 0
+KALSHI_ALERT_COOLDOWN = 3600  # don't re-alert same ticker within 1 hour
+
 # ------------------------------------------------------------------ #
 #  Signal Pipeline                                                     #
 # ------------------------------------------------------------------ #
@@ -168,12 +174,14 @@ async def start_uw_stream():
 
 async def kalshi_scan_loop():
     """Periodically scan Kalshi for edge opportunities and broadcast to frontend."""
+    import time as _time
+    global _kalshi_alert_counter
+
     await asyncio.sleep(15)  # wait for startup
     while True:
         try:
             balance_data = await kalshi_client.get_balance()
-            # balance field is in cents
-            balance_usd  = balance_data.get("balance", 0) / 100
+            balance_usd  = balance_data.get("balance", 0) / 100  # cents → dollars
             markets      = await kalshi_client.get_markets(status="open", limit=200)
             opps         = kalshi_scanner.scan(markets, balance_usd)
 
@@ -189,30 +197,87 @@ async def kalshi_scan_loop():
                     }
                 })
 
-                # Telegram alert for top opportunity if score >= 7
-                best = top[0]
-                if best.score() >= 7.0 and _startup_complete:
-                    await telegram.send_info(
-                        f"🎰 <b>KALSHI OPPORTUNITY</b>\n"
-                        f"{'─'*28}\n"
-                        f"<b>{best.title[:60]}</b>\n"
-                        f"Type: <b>{best.opportunity_type.upper()}</b>\n"
-                        f"Side: <b>{best.side.upper()}</b> @ {best.market_price*100:.0f}¢\n"
-                        f"Bet: <b>{best.bet_contracts}x</b> contracts = <b>${best.bet_cost_usd:.2f}</b>\n"
-                        f"DTE: {best.dte:.1f}d  Vol: {int(best.volume):,}\n"
-                        f"Score: <b>{best.score():.1f}/10</b>\n"
-                        f"<i>{best.rationale}</i>\n"
-                        f"<i>Use dashboard Kalshi tab to execute</i>"
-                    )
-                    logger.info(
-                        f"KALSHI: {best.ticker} {best.side.upper()} @ {best.market_price*100:.0f}¢ "
-                        f"type={best.opportunity_type} score={best.score()}"
-                    )
+                # Telegram alert with Execute/Skip buttons (score >= 7, not recently alerted)
+                if _startup_complete:
+                    now = _time.time()
+                    for opp in top:
+                        if opp.score() < 7.0:
+                            break  # sorted by score, rest will be lower
+                        last = _kalshi_alerted.get(opp.ticker, 0)
+                        if now - last < KALSHI_ALERT_COOLDOWN:
+                            continue  # skip — already alerted recently
+
+                        _kalshi_alert_counter += 1
+                        alert_id = _kalshi_alert_counter
+                        opp_dict = opp.to_dict()
+                        # Store params needed to place the order
+                        _kalshi_pending[alert_id] = {
+                            "ticker":    opp.ticker,
+                            "side":      opp.side if opp.side != "watch" else "yes",
+                            "count":     opp.bet_contracts,
+                            "price_cents": round(opp.market_price * 100),
+                            "title":     opp.title,
+                            "opp_dict":  opp_dict,
+                            "expires":   now + 600,  # 10-minute window
+                        }
+                        _kalshi_alerted[opp.ticker] = now
+
+                        msg_id = await telegram.send_kalshi_alert(opp_dict, alert_id)
+                        logger.info(
+                            f"KALSHI ALERT #{alert_id}: {opp.ticker} {opp.side.upper()} "
+                            f"@ {opp.market_price*100:.0f}¢ score={opp.score():.1f}"
+                        )
+                        break  # one alert per scan cycle to avoid spam
 
         except Exception as e:
             logger.error(f"Kalshi scan loop error: {e}")
 
         await asyncio.sleep(settings.kalshi_scan_interval)
+
+
+async def confirm_kalshi(alert_id: int, msg_id: int):
+    """User tapped Execute on a Kalshi alert — place the order."""
+    pending = _kalshi_pending.pop(alert_id, None)
+    if not pending:
+        await telegram.edit_message(msg_id, "⚠️ Order expired or already processed.")
+        return
+
+    import time as _time
+    if _time.time() > pending["expires"]:
+        await telegram.edit_message(msg_id, "⏰ Order expired (10-min window passed).")
+        return
+
+    try:
+        result = await kalshi_client.place_order(
+            ticker=pending["ticker"],
+            side=pending["side"],
+            action="buy",
+            count=pending["count"],
+            order_type="limit",
+            price=pending["price_cents"],
+        )
+        order_id = (result.get("order") or {}).get("order_id", "?")
+        status   = (result.get("order") or {}).get("status", "submitted")
+        await telegram.edit_message(
+            msg_id,
+            f"✅ <b>KALSHI ORDER PLACED</b>\n"
+            f"Market: {pending['title'][:60]}\n"
+            f"Side: {pending['side'].upper()} × {pending['count']} @ {pending['price_cents']}¢\n"
+            f"Order ID: <code>{order_id}</code>\n"
+            f"Status: <b>{status}</b>"
+        )
+        logger.info(f"Kalshi order placed: {pending['ticker']} {pending['side']} "
+                    f"×{pending['count']} @ {pending['price_cents']}¢ → {order_id}")
+    except Exception as e:
+        logger.error(f"Kalshi order failed: {e}")
+        await telegram.edit_message(msg_id, f"❌ Order failed: {e}")
+
+
+async def skip_kalshi(alert_id: int, msg_id: int):
+    """User tapped Skip on a Kalshi alert."""
+    pending = _kalshi_pending.pop(alert_id, None)
+    title = (pending or {}).get("title", "")[:50]
+    await telegram.edit_message(msg_id, f"⏭ Skipped: {title}")
 
 
 async def iv_scanner_loop():
@@ -280,6 +345,8 @@ async def lifespan(app: FastAPI):
         await telegram.start_polling(
             on_confirm=auto_trade.confirm_trade,
             on_skip=auto_trade.skip_trade,
+            on_kalshi_confirm=confirm_kalshi,
+            on_kalshi_skip=skip_kalshi,
         )
         logger.info(f"Telegram: {'chat_id=' + str(telegram.chat_id) if telegram.chat_id else 'waiting for /start'}")
 

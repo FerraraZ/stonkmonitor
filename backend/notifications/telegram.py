@@ -22,6 +22,8 @@ class TelegramNotifier:
         self._polling = False
         self._on_confirm: Optional[Callable] = None
         self._on_skip: Optional[Callable] = None
+        self._on_kalshi_confirm: Optional[Callable] = None
+        self._on_kalshi_skip: Optional[Callable] = None
 
     def _url(self, method: str) -> str:
         return TGAPI.format(token=self.token, method=method)
@@ -172,6 +174,58 @@ class TelegramNotifier:
         }
         return await self.send_message(text, reply_markup=keyboard)
 
+    async def send_kalshi_alert(self, opp: dict, alert_id: int) -> Optional[int]:
+        """
+        Send a Kalshi opportunity card with Execute/Skip inline buttons.
+        opp keys: ticker, title, side, market_price_cents, opportunity_type,
+                  bet_contracts, bet_cost_usd, dte, volume, score, rationale
+        """
+        if not self.enabled or not self.chat_id:
+            return None
+
+        score    = float(opp.get("score", 0))
+        filled   = int(score)
+        score_bar = "█" * filled + "░" * (10 - filled)
+
+        type_emoji = {
+            "near_certain":     "🔒",
+            "high_vol_extreme": "🔥",
+            "mover":            "📈",
+            "active":           "⚖️",
+        }.get(opp.get("opportunity_type", ""), "🎰")
+
+        side  = (opp.get("side") or "yes").upper()
+        price = opp.get("market_price_cents", 0)
+        cost  = float(opp.get("bet_cost_usd", 0))
+        count = opp.get("bet_contracts", 1)
+
+        text = (
+            f"<b>{type_emoji} KALSHI OPPORTUNITY</b>\n"
+            f"{'─' * 30}\n"
+            f"<b>{opp.get('title', '')[:70]}</b>\n"
+            f"Score: <b>{score:.1f}/10</b>  <code>[{score_bar}]</code>\n"
+            f"{'─' * 30}\n"
+            f"Side:  <b>{side}</b> @ <b>{price:.0f}¢</b>\n"
+            f"Order: <b>{count}x contracts</b> = <b>${cost:.2f}</b>\n"
+            f"DTE:   {opp.get('dte', 0):.0f}d  |  Vol: {int(opp.get('volume', 0)):,}\n"
+            f"{'─' * 30}\n"
+            f"<i>{opp.get('rationale', '')[:150]}</i>\n"
+            f"⏳ <b>Offer expires in 10 min</b>"
+        )
+
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": f"✅  EXECUTE  ${cost:.2f}",
+                     "callback_data": f"kalshi_exec_{alert_id}"},
+                    {"text": "❌  SKIP",
+                     "callback_data": f"kalshi_skip_{alert_id}"},
+                ],
+                [{"text": "📊 Dashboard", "url": "http://localhost:3000"}],
+            ]
+        }
+        return await self.send_message(text, reply_markup=keyboard)
+
     async def send_info(self, text: str):
         """Simple informational message (no buttons)."""
         await self.send_message(text)
@@ -182,10 +236,14 @@ class TelegramNotifier:
         self,
         on_confirm: Callable[[int, int], Awaitable],
         on_skip: Callable[[int, int], Awaitable],
+        on_kalshi_confirm: Optional[Callable[[int, int], Awaitable]] = None,
+        on_kalshi_skip: Optional[Callable[[int, int], Awaitable]] = None,
     ):
         """Start background task to poll for button taps."""
         self._on_confirm = on_confirm
         self._on_skip = on_skip
+        self._on_kalshi_confirm = on_kalshi_confirm
+        self._on_kalshi_skip = on_kalshi_skip
         self._polling = True
         asyncio.create_task(self._poll_loop())
         logger.info("Telegram polling started")
@@ -220,7 +278,19 @@ class TelegramNotifier:
             if not self.chat_id:
                 self.chat_id = cb["message"]["chat"]["id"]
 
-            if data.startswith("confirm_"):
+            if data.startswith("kalshi_exec_"):
+                alert_id = int(data.split("_", 2)[2])
+                await self.answer_callback(cb_id, "Placing Kalshi order...")
+                if self._on_kalshi_confirm:
+                    await self._on_kalshi_confirm(alert_id, msg_id)
+
+            elif data.startswith("kalshi_skip_"):
+                alert_id = int(data.split("_", 2)[2])
+                await self.answer_callback(cb_id, "Skipped")
+                if self._on_kalshi_skip:
+                    await self._on_kalshi_skip(alert_id, msg_id)
+
+            elif data.startswith("confirm_"):
                 trade_id = int(data.split("_", 1)[1])
                 await self.answer_callback(cb_id, "Executing...")
                 if self._on_confirm:
