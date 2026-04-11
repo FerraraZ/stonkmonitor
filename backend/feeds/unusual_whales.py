@@ -148,16 +148,22 @@ class UnusualWhalesClient:
         on_event: Callable,
         channels: list[str] = None,
         poll_interval: float = 15.0,
+        seed_seen_ids: set = None,
     ):
         """
         Poll UW REST endpoints on a tight loop to simulate streaming.
         Deduplicates by tracking seen IDs so each event fires only once.
         channels can include: "options-flow", "darkpool", "insider-trades", "congress-trades"
+
+        seed_seen_ids: pre-populated set of IDs from the DB so restarts don't
+                       re-fire already-processed congress/insider events.
         """
         if channels is None:
             channels = ["options-flow", "darkpool", "insider-trades", "congress-trades"]
 
-        seen_ids: set[str] = set()
+        # Seed with any IDs already in DB so restarts don't replay old events
+        seen_ids: set[str] = set(seed_seen_ids) if seed_seen_ids else set()
+        logger.info(f"UW feed: seeded dedup set with {len(seen_ids)} existing IDs")
 
         async def fetch_and_emit(feed_type: str, items: list):
             for item in items:

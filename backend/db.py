@@ -532,6 +532,23 @@ class Database:
         )
 
     # ── Analytics queries ────────────────────────────────────────────────
+    async def get_seen_ids(self) -> set:
+        """
+        Return a set of all IDs already persisted across slow-moving feeds
+        (congress + insider). Used to pre-populate the UW feed's dedup set
+        on startup so restarts don't re-fire old events as notifications.
+        """
+        ids: set = set()
+        for sql in [
+            "SELECT id FROM congress_trades",
+            "SELECT id FROM insider_trades",
+        ]:
+            rows = await self._query(sql)
+            for r in rows:
+                if r.get("id"):
+                    ids.add(r["id"])
+        return ids
+
     async def get_db_stats(self) -> dict:
         stats = {}
         for tbl in ["options_flow", "dark_pool", "insider_trades",

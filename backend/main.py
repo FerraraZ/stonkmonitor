@@ -110,6 +110,46 @@ KALSHI_SELL_THRESHOLDS = [3.0, 5.0, 10.0]  # alert at 3x, 5x, 10x gain
 # ------------------------------------------------------------------ #
 #  Signal Pipeline                                                     #
 # ------------------------------------------------------------------ #
+
+# Slow-moving feeds (congress/insider) file days or weeks after the
+# actual trade. Don't send notifications for events older than this.
+_STALE_HOURS = 48
+_STALE_SIGNAL_TYPES = {"congress_trade", "insider_buy", "insider_sell"}
+
+def _is_stale(signal) -> bool:
+    """
+    Returns True if this is a congress/insider signal whose underlying
+    transaction date is older than _STALE_HOURS. These get stored and
+    shown in the dashboard but don't trigger Telegram/Discord/auto-trade.
+    """
+    if signal.type.value not in _STALE_SIGNAL_TYPES:
+        return False
+    try:
+        from datetime import datetime, timezone, timedelta
+        raw = signal.raw or {}
+        # Try several date fields UW uses across feeds
+        date_str = (
+            raw.get("transaction_date") or
+            raw.get("filed_at_date") or
+            raw.get("date") or
+            raw.get("created_at") or
+            ""
+        )
+        if not date_str:
+            return False
+        # Parse — handles both date-only "2024-01-15" and ISO datetimes
+        date_str = date_str.strip()[:10]  # take YYYY-MM-DD portion
+        txn_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - txn_date).total_seconds() / 3600
+        if age_hours > _STALE_HOURS:
+            logger.debug(f"Stale {signal.type.value} suppressed: {signal.ticker} "
+                         f"({date_str}, {age_hours:.0f}h old)")
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def handle_signal(signal):
     """Score → store → broadcast → notify."""
     if signal is None:
@@ -129,7 +169,7 @@ async def handle_signal(signal):
     await db.save_signal(signal, min_score=7.0)
 
     # Only notify + auto-trade after startup backfill is done
-    if _startup_complete:
+    if _startup_complete and not _is_stale(signal):
         await discord.send_signal(signal, score_threshold=settings.sweep_score_threshold)
         await pushover.send_signal(signal, score_threshold=settings.sweep_score_threshold)
         # Auto-trade evaluation (non-blocking — don't let it crash the pipeline)
@@ -191,10 +231,13 @@ async def process_uw_event(raw: dict):
 # ------------------------------------------------------------------ #
 async def start_uw_stream():
     """Background task: keep UW WebSocket alive forever."""
-    logger.info("Starting Unusual Whales live stream...")
+    # Pre-load seen IDs from DB so restarts don't replay old congress/insider events
+    seed_ids = await db.get_seen_ids()
+    logger.info(f"Starting Unusual Whales live stream (seeded {len(seed_ids)} seen IDs)...")
     await uw_client.stream_flow(
         on_event=process_uw_event,
         channels=["options-flow", "darkpool", "insider-trades", "congress-trades"],
+        seed_seen_ids=seed_ids,
     )
 
 
