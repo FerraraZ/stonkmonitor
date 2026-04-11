@@ -160,17 +160,12 @@ class TelegramNotifier:
         )
 
         keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": f"✅  EXECUTE  ${risk:,.0f}",
-                     "callback_data": f"confirm_{trade['id']}"},
-                    {"text": "❌  SKIP",
-                     "callback_data": f"skip_{trade['id']}"},
-                ],
-                [
-                    {"text": "📊 Dashboard", "url": "http://localhost:3000"},
-                ],
-            ]
+            "inline_keyboard": [[
+                {"text": f"✅  EXECUTE  ${risk:,.0f}",
+                 "callback_data": f"confirm_{trade['id']}"},
+                {"text": "❌  SKIP",
+                 "callback_data": f"skip_{trade['id']}"},
+            ]]
         }
         return await self.send_message(text, reply_markup=keyboard)
 
@@ -214,15 +209,12 @@ class TelegramNotifier:
         )
 
         keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": f"✅  EXECUTE  ${cost:.2f}",
-                     "callback_data": f"kalshi_exec_{alert_id}"},
-                    {"text": "❌  SKIP",
-                     "callback_data": f"kalshi_skip_{alert_id}"},
-                ],
-                [{"text": "📊 Dashboard", "url": "http://localhost:3000"}],
-            ]
+            "inline_keyboard": [[
+                {"text": f"✅  EXECUTE  ${cost:.2f}",
+                 "callback_data": f"kalshi_exec_{alert_id}"},
+                {"text": "❌  SKIP",
+                 "callback_data": f"kalshi_skip_{alert_id}"},
+            ]]
         }
         return await self.send_message(text, reply_markup=keyboard)
 
