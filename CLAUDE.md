@@ -65,6 +65,11 @@ KALSHI_KEY_ID=<your_kalshi_key_id>
 KALSHI_PRIVATE_KEY=<path_to_kalshi_private.pem>
 KALSHI_DEMO=false
 KALSHI_SCAN_INTERVAL=60
+# Optional — cross-platform Kalshi ↔ Polymarket arb (leave blank to disable)
+DOME_API_KEY=<your_dome_key>
+DOME_BASE_URL=https://api.domeapi.io
+POLYMARKET_CLOB_URL=https://clob.polymarket.com
+CROSS_ARB_MIN_EDGE=0.05
 ```
 
 `.env` and `*.pem` are gitignored. On a new machine, copy `.env.example` → `.env`
@@ -81,13 +86,18 @@ and place the RSA private key at the path in `KALSHI_PRIVATE_KEY`.
 | `main.py` | FastAPI app, lifespan, all background tasks, WebSocket broadcast |
 | `config.py` | Pydantic settings loaded from `.env` |
 | `db.py` | aiosqlite wrapper — 7 tables (signals, options_flow, dark_pool, insider_trades, congress_trades, pending_trades, watchlist) |
-| `feeds/unusual_whales.py` | UW REST polling — **sequential per channel** (2s gap) to avoid 3-concurrent limit |
+| `feeds/unusual_whales.py` | UW REST polling — **session-aware per-channel scheduler**, budget-gated |
+| `feeds/uw_budget.py` | UW daily call budget tracker + US/Eastern session classifier (rth/extended/overnight/weekend) |
 | `feeds/kalshi.py` | Kalshi REST client with RSA-PSS signing |
+| `feeds/dome.py` | Dome API client (Polymarket + Kalshi metadata search, `/v1/polymarket/markets`, `/v1/kalshi/markets`) |
+| `feeds/polymarket.py` | Polymarket CLOB client (public, no auth) — `/midpoint`, `/price`, YES-side price helper |
 | `feeds/alpaca_feed.py` | Alpaca market data |
 | `signals/engine.py` | Signal scorer — converts raw events to Signal objects (1–10) |
 | `signals/patterns.py` | Cross-feed pattern detector (9 patterns, up to score 10) |
 | `signals/auto_trade.py` | Alpaca auto-trade: sizes positions, queues trades, handles confirm/skip |
-| `signals/kalshi_scanner.py` | Kalshi opportunity surfacer (4 types: near_certain, high_vol_extreme, mover, active) |
+| `signals/kalshi_scanner.py` | Kalshi opportunity surfacer (6 types: near_certain, yield_farm, smart_money, high_vol_extreme, mover, active; maker-price limit orders) |
+| `signals/kalshi_arb.py` | Internal monotonicity arb (same-event threshold inversions, normalized-prefix grouping) |
+| `signals/kalshi_poly_arb.py` | Cross-platform Kalshi ↔ Polymarket arb via Dome (Jaccard+SequenceMatcher title match, threshold 0.70) |
 | `signals/earnings_scanner.py` | Yang-Zhang IV/RV earnings premium-selling screener (from trade calculator) |
 | `notifications/telegram.py` | Telegram bot — send_trade_alert, send_kalshi_alert, send_kalshi_position_alert, long-poll loop |
 | `notifications/discord.py` | Discord webhook notifier |
@@ -179,12 +189,48 @@ IV scanner loop (every 5 min per watchlist ticker):
 
 ## Unusual Whales API — Critical Details
 
-**Rate limit:** 3 concurrent requests max.
-- Fixed by polling channels **sequentially** with 2s gaps (not `asyncio.gather`)
+**Rate limit:** 3 concurrent requests + **15,000 requests/day** on Standard tier.
+- Fixed concurrency by polling channels **sequentially** with 2s gaps (not `asyncio.gather`)
 - `Retry-After` header respected on 429s
+- `x-uw-daily-req-count` / `x-uw-token-req-limit` response headers tracked live by `feeds/uw_budget.py`
 
-**Polling:** REST polling (not WebSocket) every 15s per channel.
-- Channels: `options-flow`, `darkpool`, `insider-trades`, `congress-trades`
+**Polling is session-aware — no longer a flat 15s round the clock.**
+Per-channel intervals per session (see `SCHEDULE` in `feeds/uw_budget.py`):
+
+| Session | options-flow | darkpool | insider-trades | congress-trades |
+|---------|--------------|----------|----------------|-----------------|
+| RTH (M–F 09:30–16:00 ET) | 15s | 15s | 60s | 60s |
+| Extended (M–F 04:00–09:30 + 16:00–20:00) | 60s | 60s | 300s | 300s |
+| Overnight (M–F 20:00–04:00) | **off** | **off** | 900s | 1800s |
+| Weekend | **off** | **off** | 3600s | 3600s |
+
+- **Throttle** at ≥80% daily: all intervals doubled
+- **Pause** at ≥95% daily: `stream_flow()` idles 5 min; `_get()` hard-blocks stray callers
+- `uw_budget_monitor_loop` logs + broadcasts every 10 min, Telegram warns at 80%/95%
+- `GET /api/uw/budget` returns live snapshot
+- Projected: ~5,300 calls/weekday, ~48 calls/weekend day (was ~11,250 flat)
+
+---
+
+## Kalshi Arb Scanners
+
+**`signals/kalshi_arb.py` — Internal monotonicity arb**
+- Groups markets by `event_ticker` → `(direction, normalized_title_prefix)` so Janet Mills never gets compared to Graham Platner
+- Regex handles `above/at least/at or above/greater than/over/more than`, `below/under/less than/at or below`, `X or more/X+`, `before/by end of X`, `between $X and $Y`
+- Spread guard: both legs must have spread < 10¢ and non-zero bids
+- Conservative edge: `yb_hi - ya_lo` (sell rich @ bid, buy cheap @ ask); min 3¢
+- Sum-violation check present but **DISABLED** — fires on non-MECE cumulative brackets
+- Broadcasts `{type: "kalshi_arb"}`; Telegram warns when top edge ≥ 3¢
+
+**`signals/kalshi_poly_arb.py` — Cross-platform Kalshi ↔ Polymarket arb**
+- Requires `DOME_API_KEY`; silently disabled if blank
+- Top 30 Kalshi markets by volume, 1-hour per-ticker match cache
+- Similarity = (Jaccard ∪ SequenceMatcher on sorted keyword stream) / 2
+- Threshold **0.70** (verified: Newsom 0.73 ✅, Bulgarian president 0.63 ❌)
+- Two edge directions: `edge_a = kyb - pya` and `edge_b = pyb - kya`; surfaces with `match_confidence` + **both** full titles for operator verification
+- Polymarket price semantics (critical): `/price?side=BUY` returns best **bid**, `/price?side=SELL` returns best **ask** (book-maker perspective). Verified against `/midpoint`. `feeds/polymarket.py` swaps the labels before returning.
+
+Both run every Kalshi scan cycle and are silent most of the time — that's the correct steady state on efficient markets.
 
 ---
 
@@ -219,17 +265,21 @@ don't run test scripts that also call getUpdates — you'll get a 409 conflict e
 ## Kalshi Scanner — Strategy
 
 Markets have 3M+ contracts — efficiently priced. We don't try to model probabilities.
-Instead we **surface** interesting markets in 4 categories:
+Instead we **surface** interesting markets in 6 categories:
 
 | Type | Criteria | Play |
 |------|----------|------|
 | `near_certain` | DTE ≤ 30, price ≤ 5¢ or ≥ 95¢ | Buy cheap side for lotto upside, OR buy expensive side for near-guaranteed yield |
+| `yield_farm` | price 88–94.9¢, DTE ≤ 3d, annualized yield ≥ 100% | Short-dated almost-certain contracts with triple-digit annualized return |
+| `smart_money` | volume Z-score ≥ 2.5 vs 20-scan rolling mean + price move ≥ 3¢ | Unusual size hitting against a visible price move |
 | `high_vol_extreme` | vol > 100k, price ≤ 8¢ or ≥ 92¢ | Crowd has decided — fade or follow |
 | `mover` | price_move ≥ 8¢, vol > 10k | Momentum or mean-reversion |
 | `active` | vol > 500k, price 30–70¢ | Active debate — take a side |
 
 **Score formula:** extremeness × volume × time-urgency + type bonus
 **Alerts:** score ≥ 7, 1-hour cooldown per ticker, max 1 per scan cycle
+
+**Maker pricing:** For each opportunity the scanner also computes a `maker_price` (limit at bid-side so you earn the spread instead of crossing it). Telegram card shows both ask and maker; execution uses `maker_cents`. Per-ticker volume rolling window: `_volume_history: dict[str, deque]` with `VOL_HIST_LEN=20`.
 
 **Position tracking:** When user taps Execute on Telegram:
 - `_kalshi_positions[ticker]` stores entry_cents, contracts, side
@@ -328,12 +378,21 @@ watchlist          -- tickers for IV + earnings scanning
 5. **Telegram localhost URL** — `http://localhost:3000` in inline buttons causes silent sendMessage failure. Never do this.
 6. **Telegram getUpdates conflict** — only one process can long-poll at a time. Stop backend before running test scripts.
 7. **Kalshi scanner finding 0 opps** — original approach tried to model probability edge. Markets with 3M+ contracts are efficiently priced. Switched to surfacer strategy.
+8. **Kalshi arb 126 false positives** — sum_violation was firing on non-MECE cumulative brackets (e.g. "retire before 2027/28/29"). Fix: disabled sum_violation, added `_normalize_prefix` grouping so only markets with identical prefix after number-stripping get compared.
+9. **Polymarket bid/ask reversed** — `/price?side=BUY` returns best *bid*, `/price?side=SELL` returns best *ask* (book-maker perspective). Verified against `/midpoint`. `feeds/polymarket.py` swaps labels.
+10. **UW API at 75% daily burn** — was polling all 4 channels every 15s round the clock. Fix: session-aware per-channel schedule in `feeds/uw_budget.py` (options/darkpool off overnight + weekends; insider/congress stretched; throttle at 80%, pause at 95%). Weekday burn: 11,250 → ~5,300.
 
 ---
 
-## Recent Work (last session)
+## Recent Work
 
-- ✅ Kalshi scanner rewritten as opportunity surfacer (4 types)
+- ✅ Kalshi scanner rewritten as opportunity surfacer (expanded to 6 types — added `yield_farm`, `smart_money`)
+- ✅ Maker pricing on Kalshi execute cards (earn the spread, not pay it)
+- ✅ Kalshi internal monotonicity arb (`signals/kalshi_arb.py`) with normalized-prefix grouping
+- ✅ Cross-platform Kalshi ↔ Polymarket arb (`signals/kalshi_poly_arb.py`) via Dome API + public Polymarket CLOB
+- ✅ Similarity scoring combines Jaccard + SequenceMatcher, threshold 0.70
+- ✅ **UW API budget governor** — `feeds/uw_budget.py` tracks daily call count via response headers, enforces session-aware per-channel polling cadence, auto-throttles at 80%, auto-pauses at 95%, Telegram warns, `/api/uw/budget` endpoint
+- ✅ IV scanner skips weekends, slows in extended/overnight sessions
 - ✅ Kalshi Telegram alerts with Execute/Skip buttons (fixed localhost URL bug)
 - ✅ Position monitor — tracks buys, alerts at 3x/5x/10x for exits
 - ✅ Full market pagination — scans all categories (was capped at 200)
