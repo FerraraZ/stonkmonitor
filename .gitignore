@@ -1,0 +1,52 @@
+# ── Environment / Secrets ─────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.env
+*.pem
+
+# ── Claude Code internal files (may contain API keys from session history) ──
+.claude/
+
+# ── Database ──────────────────────────────────────────────────────────
+backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+
+# ── Node / Next.js ────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+.vercel/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── OS ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ───────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Logs ─────────────────────────────────────────────────────────────
+*.log
