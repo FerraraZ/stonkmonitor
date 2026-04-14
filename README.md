@@ -53,8 +53,21 @@ Auto-Trade Engine
 Telegram card on your phone
   [✅ EXECUTE $840]  [❌ SKIP]
         ↓ tap
-Alpaca limit order placed instantly
+Alpaca **bracket order** placed instantly
+  • Server-side TP limit + SL stop from the moment of entry
+  • Options: TP +80%, SL -40%  |  Equity: TP +15%, SL -5%
+  • Falls back to plain limit if bracket not supported
 ```
+
+**Position Monitor (TP/SL)** — runs every 2 min during market hours:
+
+| Trigger | Action | Notification |
+|---------|--------|--------------|
+| **+80% gain** | Sell 50% (market order) | 🎯 TAKE PROFIT → Telegram |
+| **-20% loss** | Sell 50% (trim) | ✂️ TRIM → Telegram |
+| **-40% loss** | Liquidate 100% | 🛑 STOP LOSS → Telegram |
+
+All thresholds configurable via `.env` (`POS_TP_PCT`, `POS_TRIM_PCT`, `POS_SL_PCT`, etc). Each action fires once per position — no double-triggers. Pauses overnight and weekends.
 
 ---
 
